@@ -1,0 +1,2972 @@
+---
+title: "Role of Sleep duration in modifying Asthma -> all-cause mortality"
+author: "Team Beaver"
+date: "2025-12-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  word_document: default
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+always_allow_html: true
+---
+
+
+# Step 1: Data pulling and harmonization
+## a) Libraries to be used
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+# Data Import and Cleaning
+library(readr)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(labelled)
+library(tidyr)
+
+# Survey Design and Analysis
+library(survey)
+library(srvyr)
+library(nhanesA)
+
+# Missing Data Handling and Diagnostics
+library(naniar)
+library(mice)
+library(VIM)
+
+# Descriptive and Exploratory Analysis
+library(DataExplorer)
+library(gtsummary)
+
+# Imputation and Modelling
+library(mitools)      # FOR imputationList() and other MI tools
+library(knitr)
+library(kableExtra)
+library(ggpubr)   # for ggarrange
+library(survival)
+library(survminer)
+library(car)
+library(Publish)
+library(MatchIt) # Needed for matching functions later
+
+library(mice)
+library(dplyr)
+library(purrr)
+library(survival) # For nelsonaalen() and survSplit()
+library(survey)   # For svydesign()
+library(mitools)  # For imputationList()
+
+# Visualization and Reporting
+library(ggplot2)
+library(DiagrammeR)
+library(glue)
+```
+
+
+## b)  Data Pull
+
+
+```{r}
+# ---- Libraries ----
+library(NHANES)  # for nhanes()
+library(readr)   # for read_fwf, fwf_cols
+library(dplyr)
+library(purrr)
+
+# ---- Config: cycles ----
+cycle_years <- c(
+  D = 2005,
+  E = 2007,
+  F = 2009,
+  G = 2011,
+  H = 2013,
+  I = 2015,
+  J = 2017
+)
+
+# ---- Variable map (correct file prefixes) ----
+# Use RAW codes; we’ll read with translated = FALSE and UPPER-case names
+nhanes_var_map <- list(
+  DEMO = list(
+    survey.weight = "WTMEC2YR",
+    psu           = "SDMVPSU",
+    strata        = "SDMVSTRA",
+    sex           = "RIAGENDR",
+    age           = "RIDAGEYR",
+    race          = "RIDRETH1",
+    child_ed      = "DMDEDUC2",
+    adult_ed      = "DMDEDUC3",
+    marital       = "DMDMARTL",
+    PIR           = "INDFMPIR"
+  ),
+
+  # Sleep: 2005–2014 (D–H): SLD010H; 2015–2018 (I–J): SLD012
+  SLQ = list(
+    duration_I_J = "SLD012",
+    duration_D_H = "SLD010H"
+  ),
+
+  BMX = list(
+    BMI = "BMXBMI"
+  ),
+
+  SMQ = list(
+    smokes = "SMQ020"
+  ),
+
+  DBQ = list(
+    diet = "DBQ700"
+  ),
+
+  MCQ = list(
+    ever_asthma      = "MCQ010",
+    active_asthma    = "MCQ035",
+    cancer           = "MCQ220",
+    emergency_asthma = "MCQ050"
+  ),
+
+  # Physical activity: PAQ605 (E–J). For D we’ll use PAD200.
+  PAQ = list(
+    vigorous.work2_E_J = "PAQ605"
+  ),
+
+  PAD = list(
+    vigorous.work1_D = "PAD200"
+  ),
+
+  # Household smoking: SMQFAM file (not “SMD” as a file prefix)
+  SMQFAM = list(
+    tobacco_1 = "SMD410",
+    tobacco_2 = "SMD460"
+  ),
+
+  # Employment: OCQ file. Use OCD150 (“Type of work last week”) to derive employed.
+  OCQ = list(
+    ocd150 = "OCD150"
+  )
+)
+
+# Columns we want to guarantee exist in the combined set
+guaranteed_optional_cols <- c("employed", "tobacco_1", "tobacco_2")
+
+# ---- Helper: fetch one NHANES file safely and select mapped vars ----
+get_nhanes_data <- function(file_prefix, suffix, var_map) {
+  file_name <- paste0(file_prefix, "_", suffix)
+
+  dat <- tryCatch(
+    nhanes(file_name, translated = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(dat)) return(NULL)
+
+  # Make all column names upper-case
+  dat <- dat |> dplyr::rename_with(toupper)
+
+  # Build "friendly name = raw code" mapping
+  # e.g. survey.weight = "WTINT2YR"
+  select_list <- setNames(
+    c("SEQN", unlist(var_map)),
+    c("SEQN", names(var_map))
+  )
+
+  # Keep only the mappings whose RAW codes actually exist in this file
+  select_list_filtered <- select_list[select_list %in% names(dat)]
+
+  # If nothing matches, just return NULL
+  if (length(select_list_filtered) == 0L) return(NULL)
+
+  # Use dplyr::select() with tidy eval:
+  # names(select_list_filtered) = new (friendly) names
+  # values(select_list_filtered) = existing (raw) names
+  dat |>
+    dplyr::select(!!!select_list_filtered)
+}
+
+# ---- Core per-cycle builder ----
+get_cycle <- function(suffix) {
+  year <- cycle_years[[suffix]]
+  message(sprintf("\n--- Processing cycle %s (%d-%d) ---", suffix, year, year + 1))
+
+  # ----- Mortality file for this cycle -----
+  mort_file <- paste0(
+    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/",
+    "NHANES_", year, "_", year + 1, "_MORT_2019_PUBLIC.dat"
+  )
+
+  mortality <- tryCatch(
+    readr::read_fwf(
+      file = mort_file,
+      col_types = "iiiiiiii",
+      fwf_cols(
+        SEQN     = c(1, 6),
+        death    = c(16, 16),
+        followup = c(43, 45)
+      ),
+      na = c("", ".")
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(mortality)) return(NULL)
+
+  # ----- Pull files for this cycle -----
+  demo   <- get_nhanes_data("DEMO",   suffix, nhanes_var_map$DEMO)
+  if (is.null(demo)) return(NULL)
+
+  slq    <- get_nhanes_data("SLQ",    suffix, nhanes_var_map$SLQ)
+  bmx    <- get_nhanes_data("BMX",    suffix, nhanes_var_map$BMX)
+  smq    <- get_nhanes_data("SMQ",    suffix, nhanes_var_map$SMQ)
+  dbq    <- get_nhanes_data("DBQ",    suffix, nhanes_var_map$DBQ)
+  mcq    <- get_nhanes_data("MCQ",    suffix, nhanes_var_map$MCQ)
+
+  pad    <- if (suffix == "D") {
+    get_nhanes_data("PAD", suffix, nhanes_var_map$PAD)
+  } else {
+    NULL
+  }
+
+  paq    <- if (suffix != "D") {
+    get_nhanes_data("PAQ", suffix, nhanes_var_map$PAQ)
+  } else {
+    NULL
+  }
+
+  smqfam <- get_nhanes_data("SMQFAM", suffix, nhanes_var_map$SMQFAM)
+  ocq    <- get_nhanes_data("OCQ",    suffix, nhanes_var_map$OCQ)
+
+  # Start with mortality + demo
+  result <- mortality |>
+    dplyr::left_join(demo, by = "SEQN")
+
+  # Columns that may collide that we want to coalesce from the new join
+  cols_to_pref_new <- c(
+    "duration_I_J",
+    "duration_D_H",
+    "vigorous.work1_D",
+    "vigorous.work2_E_J",
+    "tobacco_1",
+    "tobacco_2",
+    "ocd150"
+  )
+
+  safe_join <- function(base, add) {
+    if (is.null(add)) return(base)
+
+    tmp <- base |>
+      dplyr::left_join(add, by = "SEQN", suffix = c("", "_NEW"))
+
+    # Prefer values from *_NEW when both exist
+    for (col in cols_to_pref_new) {
+      col_new <- paste0(col, "_NEW")
+      if (col %in% names(tmp) && col_new %in% names(tmp)) {
+        tmp <- tmp |>
+          dplyr::mutate(
+            !!col := dplyr::coalesce(.data[[col_new]], .data[[col]])
+          ) |>
+          dplyr::select(-dplyr::all_of(col_new))
+      }
+    }
+
+    # Drop any remaining *_NEW columns just in case
+    tmp |>
+      dplyr::select(-dplyr::matches("_NEW$"))
+  }
+
+  # Join all other data frames safely
+  for (df in list(slq, bmx, smq, dbq, mcq, pad, paq, smqfam, ocq)) {
+    result <- safe_join(result, df)
+  }
+
+  # Ensure presence of important columns if they never appeared
+  for (nm in c(
+    "tobacco_1", "tobacco_2",
+    "duration_I_J", "duration_D_H",
+    "vigorous.work1_D", "vigorous.work2_E_J",
+    "ocd150"
+  )) {
+    if (!nm %in% names(result)) result[[nm]] <- NA_real_
+  }
+
+  # Derivations:
+  # - Sleep duration (hours): prefer SLD012 (I–J), fallback SLD010H (D–H)
+  # - Vigorous work: PAQ605 (E–J) or PAD200 (D)
+  # - Employed (binary): 1 if OCQ says “working” (OCD150==1 or ==2 “with a job but not at work”)
+  result <- result |>
+    dplyr::mutate(
+      duration       = dplyr::coalesce(.data$duration_I_J, .data$duration_D_H),
+      vigorous.work  = dplyr::coalesce(.data$vigorous.work1_D, .data$vigorous.work2_E_J),
+      employed       = dplyr::case_when(
+        ocd150 %in% c(1, 2) ~ 1,
+        ocd150 %in% c(3, 4) ~ 0,
+        TRUE                ~ NA_real_
+      ),
+      cycle_year     = year
+    ) |>
+    dplyr::select(
+      -dplyr::any_of(c(
+        "duration_I_J", "duration_D_H",
+        "vigorous.work1_D", "vigorous.work2_E_J",
+        "ocd150"
+      ))
+    ) |>
+    dplyr::distinct()
+
+  return(result)
+}
+
+# ---- Execution: build nhanes.final ----
+cycles <- names(cycle_years)
+
+nhanes_list <- purrr::map(cycles, get_cycle)
+
+nhanes.final <- nhanes_list |>
+  purrr::keep(~ !is.null(.x)) |>
+  dplyr::bind_rows()
+
+# Quick checks
+names(nhanes.final)
+dim(nhanes.final)
+dplyr::glimpse(nhanes.final)
+
+dim(nhanes.final)
+```
+
+
+
+## c)Data harmonization
+
+```{r}
+library(dplyr)
+library(forcats)
+
+# How many cycles actually made it in
+n_cycles <- nhanes.final$cycle_year |> unique() |> length()
+
+nhanes_cleaned <- nhanes.final |>
+  mutate(
+    # 0) Combine-cycle weight
+    survey.weight = survey.weight / n_cycles,
+
+    # 1) Race/Ethnicity (RIDRETH1 codes)
+    race = dplyr::case_match(
+      as.numeric(race),
+      1 ~ "Mexican American",
+      2 ~ "Other Hispanic",
+      3 ~ "Non-Hispanic White",
+      4 ~ "Non-Hispanic Black",
+      5 ~ "Other Race - Including Multi-Racial",
+      .default = NA_character_
+    ),
+    race = forcats::fct_collapse(
+      factor(race),
+      "Hispanic" = c("Mexican American", "Other Hispanic"),
+      "Other"    = "Other Race - Including Multi-Racial"
+    ),
+    race = factor(
+      race,
+      levels = c("Hispanic","Non-Hispanic White","Non-Hispanic Black","Other")
+    ),
+
+    # 2) Physical Activity at work (PAQ605 or PAD200)
+    vigorous.work = dplyr::case_match(
+      as.numeric(vigorous.work),
+      1 ~ "Yes",
+      2 ~ "No",
+      3 ~ "Unable to do activity",
+      7 ~ NA_character_,
+      9 ~ NA_character_,
+      .default = NA_character_
+    ),
+    vigorous.work = forcats::fct_collapse(
+      factor(vigorous.work),
+      "Yes" = "Yes",
+      "No"  = c("No","Unable to do activity")
+    ),
+    vigorous.work = factor(vigorous.work, levels = c("Yes","No")),
+
+    # 3) Household tobacco exposure — HARMONIZE & COALESCE
+    #    SMD410 (2005–2012): 1 Yes, 2 No, 7/9 NA
+    tobacco_1_rec = dplyr::case_match(
+      as.numeric(tobacco_1),
+      1 ~ "Yes",
+      2 ~ "No",
+      7 ~ NA_character_,
+      9 ~ NA_character_,
+      .default = NA_character_
+    ),
+
+    #    SMD460 (2013–2018): 0 No, 1/2/3 Yes, 777/999 NA
+    tobacco_2_rec = dplyr::case_match(
+      as.numeric(tobacco_2),
+      0   ~ "No",
+      1   ~ "Yes",
+      2   ~ "Yes",
+      3   ~ "Yes",
+      777 ~ NA_character_,
+      999 ~ NA_character_,
+      .default = NA_character_
+    ),
+
+    # Unified Yes/No flag 
+    tobacco_home = dplyr::coalesce(tobacco_1_rec, tobacco_2_rec),
+    tobacco_home = factor(tobacco_home, levels = c("Yes","No")),
+
+    # Count of smokers in household
+    smokers_in_home_460 = dplyr::case_when(
+      as.numeric(tobacco_2) %in% c(0,1,2,3) ~ as.numeric(tobacco_2),
+      as.numeric(tobacco_2) %in% c(777,999) ~ NA_real_,
+      TRUE ~ NA_real_
+    ),
+    smokers_in_home_410 = dplyr::case_when(
+      as.numeric(tobacco_1) == 2 ~ 0,        # "No" => 0 smokers
+      as.numeric(tobacco_1) == 1 ~ NA_real_, # "Yes" but no count available in 2005–2012
+      as.numeric(tobacco_1) %in% c(7,9) ~ NA_real_,
+      TRUE ~ NA_real_
+    ),
+    smokers_in_home = dplyr::coalesce(smokers_in_home_460, smokers_in_home_410),
+
+    # Convenience binary
+    tobacco_home_any = dplyr::case_when(
+      tobacco_home == "Yes" ~ 1L,
+      tobacco_home == "No"  ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # 4) Education (DMDEDUC2/3)
+    education.raw = dplyr::coalesce(
+      as.numeric(child_ed),
+      as.numeric(adult_ed)
+    ),
+    education = dplyr::case_match(
+      education.raw,
+      1 ~ "Less than 9th grade",
+      2 ~ "9-11th grade",
+      3 ~ "High school graduate/ GED",
+      4 ~ "Some college or AA",
+      5 ~ "College graduate or above",
+      7 ~ NA_character_,
+      9 ~ NA_character_,
+      .default = NA_character_
+    ),
+    education = forcats::fct_collapse(
+      factor(education),
+      "Less than 9th grade"        = "Less than 9th grade",
+      "Some high school"           = "9-11th grade",
+      "High school graduate"       = "High school graduate/ GED",
+      "Some post-secondary"        = "Some college or AA",
+      "College graduate or above"  = "College graduate or above"
+    ),
+    education = factor(
+      education,
+      levels = c(
+        "Less than 9th grade",
+        "Some high school",
+        "High school graduate",
+        "Some post-secondary",
+        "College graduate or above"
+      ),
+      ordered = FALSE
+    ),
+
+    # 5) Marital status (DMDMARTL)
+    marital = dplyr::case_match(
+      as.numeric(marital),
+      1 ~ "Married",
+      2 ~ "Widowed",
+      3 ~ "Divorced",
+      4 ~ "Separated",
+      5 ~ "Never married",
+      6 ~ "Living with partner",
+      77 ~ NA_character_,
+      99 ~ NA_character_,
+      .default = NA_character_
+    ),
+    marital = forcats::fct_collapse(
+      factor(marital),
+      "Married/Living with partner" = c("Married","Living with partner"),
+      "Single" = c("Widowed","Divorced","Separated","Never married")
+    ),
+
+    # 6) PIR categories
+    PIR_cat = cut(
+      as.numeric(PIR),
+      breaks = c(-Inf, 1, 4, Inf),
+      labels = c("Low","Middle","High"),
+      right = FALSE,
+      ordered_result = FALSE
+    ),
+
+    # 7) Sleep duration
+    duration_clean = dplyr::na_if(as.numeric(duration), 77),
+    duration_clean = dplyr::na_if(duration_clean, 99),
+    duration_clean = ifelse(
+      duration_clean < 0 | duration_clean > 24,
+      NA,
+      duration_clean
+    ),
+    duration_cat = cut(
+      duration_clean,
+      breaks = c(-Inf, 7, 9, Inf),
+      labels = c("Short","Normal","Long"),
+      right = FALSE
+    ),
+    duration = factor(
+      duration_cat,
+      levels = c("Short","Normal","Long"),
+      ordered = FALSE
+    ),
+
+    # 8) BMI categories
+    BMI_cat = cut(
+      as.numeric(BMI),
+      breaks = c(-Inf, 25, 30, Inf),
+      labels = c("Underweight & Normal weight","Overweight","Obese"),
+      right = FALSE,
+      ordered_result = FALSE
+    ),
+
+    # 9) Smoking status (SMQ020)
+    smokes = dplyr::case_match(
+      as.numeric(smokes),
+      1 ~ 1,
+      2 ~ 0,
+      7 ~ NA_real_,
+      9 ~ NA_real_,
+      .default = NA_real_
+    ),
+
+    # 10) Diet quality (DBQ700)
+    diet = dplyr::case_match(
+      as.numeric(diet),
+      1 ~ "Poor",
+      2 ~ "Fair",
+      3 ~ "Good",
+      4 ~ "Very good",
+      5 ~ "Excellent",
+      7 ~ NA_character_,
+      9 ~ NA_character_,
+      .default = NA_character_
+    ),
+    diet = factor(
+      diet,
+      levels = c("Poor","Fair","Good","Very good","Excellent"),
+      ordered = FALSE
+    ),
+
+    # 11) Conditions (MCQ010/035/220/050)
+    cancer = dplyr::case_match(
+      as.numeric(cancer),
+      1 ~ 1,
+      2 ~ 0,
+      7 ~ NA_real_,
+      9 ~ NA_real_,
+      .default = NA_real_
+    ),
+    ever_asthma = dplyr::case_match(
+      as.numeric(ever_asthma),
+      1 ~ 1,
+      2 ~ 0,
+      7 ~ NA_real_,
+      9 ~ NA_real_,
+      .default = NA_real_
+    ),
+    active_asthma = dplyr::case_match(
+      as.numeric(active_asthma),
+      1 ~ 1,
+      2 ~ 0,
+      7 ~ NA_real_,
+      9 ~ NA_real_,
+      .default = NA_real_
+    ),
+    emergency_asthma = dplyr::case_match(
+      as.numeric(emergency_asthma),
+      1 ~ 1,
+      2 ~ 0,
+      7 ~ NA_real_,
+      9 ~ NA_real_,
+      .default = NA_real_
+    ),
+
+    # 12) Logical consistency
+    active_asthma = dplyr::if_else(
+      ever_asthma == 0,
+      0L,
+      as.integer(active_asthma),
+      missing = as.integer(active_asthma)
+    ),
+    emergency_asthma = dplyr::if_else(
+      ever_asthma == 0,
+      0L,
+      as.integer(emergency_asthma),
+      missing = as.integer(emergency_asthma)
+    )
+  ) |>
+  dplyr::select(
+    -c(
+      child_ed,
+      adult_ed,
+      education.raw,
+      PIR,
+      BMI,
+      duration_clean,
+      smokers_in_home_460,
+      smokers_in_home_410,
+      tobacco_1_rec,
+      tobacco_2_rec
+    )
+  )
+
+
+
+```
+
+## d)Keep the variables needed in regression models
+```{r}
+
+nhanes_cleaned <- nhanes_cleaned |>
+  dplyr::select(
+    SEQN,
+    death,
+    followup,
+    survey.weight,
+    psu,
+    strata,
+    sex,
+    age,
+    race,
+    marital,
+    smokes,
+    diet,
+    ever_asthma,
+    active_asthma,
+    emergency_asthma,
+    cancer,
+    vigorous.work,
+    employed,
+    cycle_year,
+    education,
+    PIR_cat,
+    duration,
+    BMI_cat
+  )
+
+
+```
+
+
+
+
+# Step 2:Constructing data analytic and building analytic figure
+
+
+## a)Focus on eligible participants ( 18-79)
+```{r}
+# Eligible dataset
+d.analytic <- nhanes_cleaned |>
+  filter(age >= 18 & age <= 79, !is.na(followup))
+
+dim(d.analytic )
+```
+
+
+
+## b)Number of imputed data sets
+
+```{r}
+# This is the maximum set of predictors considered for multivariable analysis
+ varset <-
+ c(
+
+ ## Exposure and modifier variables
+ 'active_asthma', 'ever_asthma', 'duration',
+
+ ## Adjustment variables
+'sex', 'age', 'marital', 'smokes', 'diet', 'cancer', 'employed', 'race', 'vigorous.work',
+ 'cycle_year', 'education', 'PIR_cat', 'BMI_cat'
+ )
+
+ # This is the the number of rows from the eligible data set
+ nrow.d.withmiss <- d.analytic |> nrow()
+ nrow.d.withmiss
+
+```
+
+
+
+## c)Number of rows from the analytic data set after listwise deletion
+```{r}
+# This is the number of rows from the analytic data set after listwise deletion
+ nrow.d.nomiss <- d.analytic [, varset] |> na.omit() |> nrow()
+ nrow.d.nomiss
+```
+
+
+
+## d)Fraction of listwise deleted records
+```{r}
+# This is the fraction of listwise deleted records
+ p.missing <- 1 - (nrow.d.nomiss/nrow.d.withmiss)
+ p.missing
+```
+
+
+
+## e)Exclude missing on outcome (death)
+
+```{r}
+nhanes.death <- d.analytic %>%
+  filter(!is.na(death))
+dim(nhanes.death)
+```
+
+
+
+## f)Table active asthma ( Yes vs No)
+
+```{r}
+
+
+d_nomiss <- d.analytic %>%
+  drop_na(all_of(varset))
+
+# (Optional) check how many rows remain
+nrow(d_nomiss)
+
+# 2. Check how active_asthma is coded in the listwise deletion dataset
+str(d_nomiss$active_asthma)
+
+table(d_nomiss$active_asthma, useNA = "ifany")
+
+
+```
+
+
+
+## g)Derivation of analytic cohort
+
+```{r}
+library(DiagrammeR)
+
+grViz("
+digraph flow {
+  graph [layout=dot, rankdir=TB, splines=polyline, nodesep=0.6, ranksep=0.4]
+  node  [shape=box, style=rounded, fontname=Helvetica, fontsize=12, margin=\"0.08,0.06\"]
+  edge  [arrowhead=normal]
+
+  # Main boxes
+  start [label=\"NHANES cycles 2005–2018\\nN = 70,190\"]
+  step2 [label=\"Participants aged 18–79\\nN = 39,248\"]
+  step3 [label=\"Outcome complete\\n(missing allowed in covariates)\\nN = 39,248\"]
+  step4 [label=\"Complete dataset on all covariates\\nN = 27,632 \"]
+
+  # Invisible midpoints on the vertical arrows
+  j12 [shape=point, width=0.01, label=\"\", color=transparent]
+  j23 [shape=point, width=0.01, label=\"\", color=transparent]
+  j34 [shape=point, width=0.01, label=\"\", color=transparent]
+
+  # Lateral boxes
+  excl_age [label=\"Age < 18 or ≥ 80: N = 30,942\", shape=box, style=\"rounded,dashed\"]
+  excl_oe  [label=\"Missing outcome: N = 0\", shape=box, style=\"rounded,dashed\"]
+  excl_cov [label=\"Missing all covariates: N = 11,616\", shape=box, style=\"rounded,dashed\"]
+
+  # Lower branch boxes
+  ever      [label=\"Active Asthma = Yes\\n(n = 2,383)\", width=2.6]
+  ever_cov  [label=\"Active Asthma = No\\n(n = 25,249 )\", width=2.6]
+
+  # Main spine
+  start -> j12  [weight=8, arrowhead=none]
+  j12   -> step2[weight=8, arrowhead=normal]
+
+  step2 -> j23  [weight=8, arrowhead=none]
+  j23   -> step3[weight=8, arrowhead=normal]
+
+  step3 -> j34  [weight=8, arrowhead=none]
+  j34   -> step4[weight=8, arrowhead=normal]
+
+  # Keep lateral boxes level with their midpoint anchors
+  {rank=same; j12; excl_age}
+  {rank=same; j23; excl_oe}
+  {rank=same; j34; excl_cov}
+
+  # Dashed connectors
+  j12 -> excl_age [style=dashed, arrowhead=none, constraint=false]
+  j23 -> excl_oe  [style=dashed, arrowhead=none, constraint=false]
+  j34 -> excl_cov [style=dashed, arrowhead=none, constraint=false]
+
+  # Lower branches
+  step4 -> ever     [minlen=2]
+  step4 -> ever_cov [minlen=2]
+
+  # Align branch nodes
+  {rank=same; ever; ever_cov}
+}
+")
+
+
+```
+
+
+
+
+# Step 3:Multiple Imputation (MICE)
+
+
+## a)Visualization/ Plot missingness
+
+```{r}
+# Visualization
+plot_missing(d.analytic)
+
+
+```
+
+
+## b)Deciding whether to implement MID
+```{r}
+# Generating the MID flag
+ # NOTE: The analysis for this project involves two distinct exposures and one
+# effect measure modifier. Accordingly, several MID flags are generated
+ # to accommodate the different analyses.
+
+ d.analytic <-
+ d.analytic |>
+
+ ## The MID flags, without considering the effect modifier
+ ## NOTE: `death` is included here, but all observations for `death` are valid.
+mutate(mid.keep.aasthma = complete.cases(death, active_asthma)) |>
+mutate(mid.keep.easthma = complete.cases(death, ever_asthma)) |>
+
+## The MID flags, considering the effect modifier
+## NOTE: `death` is included here, but all observations for `death` are valid.
+mutate(mid.keep.aasthma.i = complete.cases(death, active_asthma, duration)) |>
+mutate(mid.keep.easthma.i = complete.cases(death, ever_asthma, duration))
+```
+
+
+
+## c)Testing missingness/ MCAR test
+
+```{r}
+
+library(dplyr) # Required for if_else()
+
+test_missingness <- function(d.analytic, vars) {
+  
+  # Create a working copy of the data frame to prevent contamination.
+  working_data <- d.analytic 
+  
+  # --- MCAR Test ---
+  mcar_result <- mcar_test(working_data[vars])
+  print(mcar_result)
+  
+  if (mcar_result$p.value >= 0.05) {
+    message("Data may be MCAR (p >= 0.05). No MAR models run.")
+    
+  } else {
+    message("Warning: Data are NOT MCAR (p < 0.05). 
+            Proceeding with MAR diagnostics.")
+    
+    # --- MAR Diagnostics ---
+    for (v in vars) {
+      
+      # 1. Check if variable has missing data
+      if (all(!is.na(working_data[[v]]))) { 
+        cat("\n--- No missing values in", v, "---\n")
+        next
+      }
+      
+      cat("\n--- Running Missingness Model for", v, " ---\n")
+      
+      # 2. Prepare temporary data and missingness indicator
+      temp_data <- working_data
+      missing_var <- paste0("missing_", v)
+      temp_data[[missing_var]] <- if_else(is.na(temp_data[[v]]), 1, 0)
+      
+      # 3. Define predictors
+      predictors <- setdiff(vars, v) 
+      
+      # 4. Fit the model using tryCatch for robust error handling
+      model <- tryCatch(
+        expr = {
+          glm(as.formula(paste(
+            missing_var, "~", paste(predictors, collapse = " + ")
+          )), family = binomial, data = temp_data) 
+        },
+        error = function(e) {
+          cat("!!! ERROR: GLM failed for variable", v, ". Reason:", 
+              e$message, "!!!\n")
+          return(NULL) # Assign NULL to model if an error occurs
+        }
+      )
+      
+      # --- Guard Clause 1: Check if the model failed ---
+      if (is.null(model)) {
+        cat("!!! Skipping analysis and publish for", v, "due to model failure. 
+            !!!\n")
+        next
+      }
+      
+      # 5. Check for significance and Guard Clause 2
+      model_summary <- summary(model)
+      
+      # Check if the coefficients matrix is available and has predictors 
+      ##(> 1 row)
+      if (is.null(model_summary$coefficients) ||
+          nrow(model_summary$coefficients) <= 1) {
+        cat("!!! WARNING: Model for", v, 
+            "produced no meaningful coefficients (e.g., only intercept or 
+            singular matrix). Skipping significance check. !!!\n")
+        
+        # *** NEW: Robust publishing, even for failed models ***
+        tryCatch({
+          print(publish(model))
+        }, error = function(e) {
+          cat(paste0("!!! ERROR publishing model for ", v, ". Reason: ", 
+                     e$message, " !!!\n"))
+        })
+        next
+      }
+      
+      # Extract p-values (excluding the intercept, which is the first row)
+      pvals <- model_summary$coefficients[, "Pr(>|z|)"]
+      
+      if (any(pvals[-1] < 0.05, na.rm = TRUE)) {
+        cat("*** Note: Some predictors are SIGNIFICANT (p < 0.05).
+            Missingness is likely MAR. ***\n")
+      } else {
+        cat("Note: No predictors are significant (p >= 0.05). 
+            Missingness may still be MCAR within this model space.\n")
+      }
+      
+      # 6. Publish/Print the result (print() ensures output is displayed)
+      # *** NEW: Robust publishing for successful models ***
+      tryCatch({
+        print(publish(model))
+      }, error = function(e) {
+        cat(paste0("!!! ERROR publishing model for ", v, ". Reason: ", 
+                   e$message, " !!!\n"))
+      })
+    }
+  }
+}
+
+
+vars <- c(
+  "death","followup","survey.weight","psu","strata",
+  "active_asthma","sex","age","race","marital","smokes","diet",
+  "ever_asthma","cancer","vigorous.work","employed","cycle_year",
+  "education","PIR_cat","duration","BMI_cat", "emergency_asthma"
+)
+
+test_missingness(d.analytic, vars)
+```
+
+
+
+## d)Recommended number of imputed data sets (at minimum)
+
+```{r}
+# This is the recommended number of imputed data sets (at minimum)
+ n.imputed.data <- ceiling(100 * p.missing)
+ n.imputed.data
+```
+
+
+
+
+## e)Imputed variables
+
+```{r}
+# The following variables contain missing values, ordered alphabetically
+ vars.with.missing <-
+ c('active_asthma', 'BMI_cat', 'cancer', 'diet', 'duration', 'education',
+ 'emergency_asthma', 'employed', 'ever_asthma', 'marital', 'PIR_cat',
+ 'smokes', 'vigorous.work')
+```
+
+
+```{r}
+# If ever_asthma == 0 THEN active_asthma == 0
+ d.analytic |> with(table(ever_asthma, active_asthma))
+
+```
+
+
+```{r}
+# If ever_asthma == 0 THEN emergency_asthma == 0
+d.analytic |> with(table(ever_asthma, emergency_asthma))
+```
+
+
+# Step 5. Multiple imputation
+
+## a) Multiple imputation with MICE 
+
+
+```{r}
+
+ #First, we generate the nelsonaalen estimator, which synthesizes time-to-event 
+# information based on followup time and event status.
+ d.analytic$nelsonaalen <- nelsonaalen(d.analytic, followup, death)
+
+ # Next, select the variables to be used as imputation predictors
+ imp.predictors <-
+ c(varset, # Predictors used in multivariable modeling
+'nelsonaalen', 'death', # Outcome data
+'survey.weight', 'psu', 'strata', # Survey design features (as auxiliaries)
+'race') # Other auxiliary variables
+
+```
+
+
+## b) Configuring the Predictor Matrix and imputation methods
+
+```{r}
+# --- 1. Define Imputation Parameters ---
+MAX_ITERATIONS <- 10
+
+
+# First, we specify the imputation matrix
+imp.matrix <- make.predictorMatrix(d.analytic)
+
+## Here we override the default settings (THIS IS THE LOGICAL FLAW FROM CODE 1, but included for similarity)
+imp.matrix[names(d.analytic), ] <- 0
+imp.matrix[, names(d.analytic)] <- 0
+
+## Here we manually specify which variables will undergo imputation and which
+## variables will be used as imputation predictors
+# NOTE: 'vars.with.missing' and 'imp.predictors' must be defined beforehand.
+# Since Code 2 didn't define them, this assumes their existence.
+imp.matrix[vars.with.missing, imp.predictors] <- 1
+
+## Here we ensure that asthma variables aren't used to predict each other
+vars.asthma <- c('ever_asthma', 'active_asthma', 'emergency_asthma')
+imp.matrix['ever_asthma', vars.asthma] <- 0
+imp.matrix['active_asthma', vars.asthma] <- 0
+imp.matrix['emergency_asthma', vars.asthma] <- 0
+
+## Here we ensure that a given variable is not used to impute itself
+diag(imp.matrix) <- 0
+
+# Second, we implement the MICE procedure
+imputed_data<- mice(
+  data = d.analytic,
+  m = n.imputed.data,
+  maxit = MAX_ITERATIONS,
+  method = 'pmm',
+  predictorMatrix = imp.matrix,
+  seed = 123,
+  printFlag = FALSE # Adopted from Code 1 to suppress output
+)
+
+print("--- MICE Imputation Complete ---")
+
+# --- 4. Stack Imputed Eligible Data ---
+impdata_eligible <- mice::complete(imputed_data, "long", include = FALSE)
+impdata_eligible$ineligible <- 0
+
+
+```
+
+
+
+## c) Assess Imputation Quality
+
+```{r}
+# Check the trace plots for all imputed variables
+plot(imputed_data)
+
+```
+
+
+## d)Other steps after imputation
+```{r}
+
+library(dplyr)
+
+# --- 5. Isolate and Replicate Ineligible Data ---
+eligible_ids <-d.analytic$SEQN
+dat_ineligible <- nhanes_cleaned %>% 
+  filter(!SEQN %in% eligible_ids)
+dat_ineligible$ineligible <- 1
+
+dat_ineligible_stacked <- purrr::map_dfr(1:n.imputed.data, ~dat_ineligible %>% 
+                                           mutate(.imp = .x))
+
+# --- 6. Harmonize and Combine Datasets ---
+
+library(dplyr)
+
+dat_ineligible_stacked$nelson_aalen <- NA_real_
+
+common_vars <- intersect(names(impdata_eligible), names(dat_ineligible_stacked))
+
+impdata_eligible_final <- impdata_eligible %>%
+  dplyr::select(dplyr::all_of(common_vars))
+
+dat_ineligible_final <- dat_ineligible_stacked %>%
+  dplyr::select(dplyr::all_of(common_vars))
+
+impdata_full_analysis <- bind_rows(impdata_eligible_final, dat_ineligible_final) %>%
+  arrange(.imp, SEQN)
+
+
+# --- 7. Filter out zero-time follow-ups ---
+impdata_filtered <- impdata_full_analysis %>%
+  filter(ineligible == 1 | (ineligible == 0 & followup > 0))
+
+# --- 8. Define Cut-points and Split the ENTIRE stacked dataset ---
+# We use the quantiles of event times from the eligible, non-imputed data
+event_times <- d.analytic$followup[d.analytic$death == 1 & 
+                                            d.analytic$followup > 0]
+cuts <- quantile(event_times, probs = c(0.2, 0.4, 0.6, 0.8), na.rm = TRUE)
+
+impdata_full_split <- survSplit(Surv(followup, death) ~ ., 
+                                data = impdata_filtered, 
+                                cut = cuts,
+                                episode = "tgroup",
+                                id = "split_id") # Use a new ID name
+
+print("--- survSplit() complete. ---")
+
+# --- 9. Create your final pooled, split survey design object ---
+allImputations_split <- imputationList(split(impdata_full_split, 
+                                             impdata_full_split$.imp))
+
+design_full_split <- svydesign(ids = ~psu,
+                               strata = ~strata,
+                               weights = ~survey.weight,
+                               nest = TRUE,
+                               data = allImputations_split)
+
+# This is the final object you will pass to the PH test function
+design_analytic_split <- subset(design_full_split, ineligible == 0)
+
+print("--- Successfully created 'design_analytic_split' object ---")
+```
+
+
+
+# Step 6:Checking Proportional hazards assumption with Ad-hoc solution
+
+
+## a)Define a custom function called svycoxph_CE_mi() that performs an advanced method to check the Proportional Hazards (PH) assumption in a Cox model when dealing with complex survey data and multiple imputation.
+
+```{r}
+# --- 1. Load all required libraries ---
+library(dplyr)
+library(survival)
+library(survey)
+library(ggplot2)
+library(knitr)
+library(mitools) # For pool() and imputationList()
+
+
+svycoxph_CE_mi <- function(formula_rhs, 
+                           design_split, 
+                           var_to_test, 
+                           tgroup_var = "tgroup",
+                           time_var = "followup",
+                           status_var = "death",
+                           main_model_fit = NULL,
+                           print_split_summary = TRUE,
+                           ...) {
+  
+  # --- 1. Extract data and formula components ---
+  data_clean <- design_split$designs[[1]]$variables # Use first imputation for setup
+  
+  # Check for required split columns
+  if (!tgroup_var %in% names(data_clean)) {
+    stop(paste("Error: tgroup_var '", tgroup_var, "' not found in design object.", sep=""))
+  }
+  if (!"tstart" %in% names(data_clean)) {
+    stop("Error: 'tstart' column not found. Was this design created with survSplit?")
+  }
+  
+  tgroups <- sort(unique(data_clean[[tgroup_var]]))
+  n_intervals <- length(tgroups)
+  
+  # --- 2. Print Main (PH) Model (if provided) ---
+  if (!is.null(main_model_fit)) {
+    print("--- Tidy Table for Final Paper (if Constant Effect Assumption is Met) ---")
+    
+    # Check if it's a pooled object
+    if ("mipo" %in% class(main_model_fit)) {
+      sum_fit <- summary(main_model_fit, all.comp = TRUE, conf.int = TRUE)
+      
+      tidy_main_model <- data.frame(
+        Variable = sum_fit$term,
+        HR = exp(sum_fit$estimate), 
+        `CI.Lower` = sum_fit$conf.low,
+        `CI.Upper` = sum_fit$conf.high,
+        `p.value` = sum_fit$p.value,
+        row.names = NULL,
+        check.names = FALSE
+      )
+      print(knitr::kable(tidy_main_model, digits = 3, format = "pipe"))
+    } else {
+      print("Warning: 'main_model_fit' was not a pooled (mipo) object. Skipping summary.")
+    }
+    cat("\n\n")
+  }
+  
+  # --- 3. Loop, Fit Pooled Models, and Extract Coefficients ---
+  print(paste("--- Running Constant Effect Check: Using", n_intervals, "intervals ---"))
+  
+  plot_results_list <- list()
+  summary_results_list <- list() 
+  
+  loop_formula <- as.formula(
+    paste0("Surv(tstart, ", time_var, ", ", status_var, ") ~ ", formula_rhs)
+  )
+  
+  for (i in tgroups) {
+    
+    design_subset <- subset(design_split, eval(as.name(tgroup_var)) == i)
+    
+    fit_list <- with(design_subset, svycoxph(loop_formula))
+    fit_pooled <- pool(fit_list)
+    
+    sum_fit <- summary(fit_pooled, all.comp = TRUE, conf.int = TRUE)
+    coefs <- summary(fit_pooled, all.comp = TRUE, conf.int = FALSE)
+    
+    # --- Extract data for the Tidy Summary Table ---
+    if (print_split_summary) {
+      
+      tstart_val <- min(design_subset$designs[[1]]$variables$tstart)
+      tstop_val <- max(design_subset$designs[[1]]$variables[[time_var]])
+      
+      tidy_summary <- data.frame(
+        Time.Interval = paste0(round(tstart_val, 0), "-", round(tstop_val, 0), " units"),
+        Variable = sum_fit$term,
+        HR = exp(sum_fit$estimate), # <-- *** FIX: Convert coef to HR ***
+        `CI.Lower` = sum_fit$conf.low,
+        `CI.Upper` = sum_fit$conf.high,
+        `p.value` = sum_fit$p.value,
+        row.names = NULL,
+        check.names = FALSE
+      )
+      summary_results_list[[i]] <- tidy_summary
+    }
+    
+    # --- Extract data for the Plot ---
+    var_index <- which(coefs$term == var_to_test)
+    if (length(var_index) > 0) {
+      coef <- coefs$estimate[var_index]
+      se <- coefs$std.error[var_index]
+    } else {
+      coef <- 0 
+      se <- 0
+    }
+    
+    plot_results_list[[i]] <- data.frame(
+      tgroup = i,
+      coef = coef,
+      se = se
+    )
+  }
+  
+  # --- 4. Print Tidy Summary Table (if requested) ---
+  if (print_split_summary) {
+    full_summary_df <- do.call(rbind, summary_results_list)
+    print("--- Tidy Summary of All Time-Interval Models (if Constant Effect is Violated) ---")
+    print(knitr::kable(full_summary_df, digits = 3, format = "pipe"))
+    cat("\n\n")
+  }
+  
+  # --- 5. Combine and Plot the Results ---
+  results_df <- do.call(rbind, plot_results_list)
+  
+  if (is.null(results_df) || nrow(results_df) == 0) {
+    stop("All models failed to converge or the variable was not found.")
+  }
+  
+  results_df <- results_df %>%
+    mutate(
+      time = 1:n(), # Use simple 1, 2, 3... for x-axis
+      ci_low = coef - 1.96 * se,
+      ci_high = coef + 1.96 * se
+    )
+  
+  print("--- Estimated Coefficients over Time (for Plot) ---")
+  print(knitr::kable(results_df, digits = 3, format = "pipe"))
+  
+  # --- 6. Build the Plot ---
+  # *** FIX: Correctly capture and use '...' arguments ***
+  plot_args <- list(...)
+  plot_title <- plot_args$title %||% paste("Time-Varying Effect Plot:", var_to_test)
+  plot_xlab <- plot_args$xlab %||% "Time Interval"
+  plot_ylab <- plot_args$ylab %||% paste("Log-Hazard Ratio (Coefficient) for", var_to_test)
+  use_classic_theme <- plot_args$use_classic_theme %||% TRUE
+  show_null_effect <- plot_args$show_null_effect %||% FALSE
+  add_smoother <- plot_args$add_smoother %||% FALSE
+  
+  plot_theme <- if (use_classic_theme) theme_classic() else theme_minimal() 
+  
+  p <- ggplot(results_df, aes(x = time, y = coef)) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2) +
+    plot_theme +
+    labs(title = plot_title, x = plot_xlab, y = plot_ylab) +
+    scale_x_continuous(breaks = 1:n_intervals, labels = 1:n_intervals)
+  
+  if (show_null_effect) {
+    p <- p + geom_hline(yintercept = 0, linetype = "dashed", color = "red")
+  }
+  
+  if (add_smoother) {
+    p <- p + geom_smooth(method = "loess", se = FALSE, linetype = "dotted", color = "blue")
+  }
+  
+  return(p)
+}
+
+# --- Internal helper for ... arguments ---
+`%||%` <- function(a, b) {
+  if (is.null(a)) b else a
+}
+
+
+```
+
+
+## b)Defines the svycoxph_CE function to test the proportional hazards 
+ (Constant Effect) assumption for svycoxph models by fitting separate models 
+ to time intervals and plotting the coefficients.
+ 
+```{r}
+
+# --- 1. Load all required libraries ---
+# Ensure these packages are listed as Imports/Depends in your DESCRIPTION file
+require(dplyr)
+require(survival)
+require(survey)
+require(ggplot2)
+require(knitr) 
+
+
+
+svycoxph_CE <- function(formula_rhs, 
+                        design, 
+                        var_to_test, 
+                        time_var = "stime", 
+                        status_var = "status", 
+                        n_intervals = 5,
+                        verbose = FALSE,
+                        print_main_model = TRUE,
+                        print_split_summary = TRUE,
+                        add_smoother = FALSE,
+                        title = NULL,
+                        xlab = NULL,
+                        ylab = NULL,
+                        use_classic_theme = TRUE,
+                        show_null_effect = FALSE) {
+  
+  # --- 1. Extract data and clean ---
+  data_full <- design$variables
+  data_clean <- data_full %>% 
+    filter(.data[[time_var]] > 0)
+  
+  model_vars <- all.vars(as.formula(paste0("~", formula_rhs)))
+  
+  if (verbose) {
+    print("--- Debug: Checking for variables in initial design ---")
+    vars_in_design <- names(data_clean)
+    vars_missing <- setdiff(model_vars, vars_in_design)
+    if (length(vars_missing) > 0) {
+      stop(paste("Error: The following model variables are missing from the input design:", 
+                 paste(vars_missing, collapse=", ")))
+    } else {
+      print("All model variables are present in the initial design.")
+    }
+    print("-------------------------------------------------")
+  }
+  
+  # --- 2. Fit the Main (Constant Effect) Model (if requested) ---
+  main_model_formula <- as.formula(
+    paste0("Surv(", time_var, ", ", status_var, ") ~ ", formula_rhs)
+  )
+  
+  if (print_main_model) {
+    print("--- Fitting Main (Constant Effect) Model (for Constant Effect-met scenario) ---")
+    main_fit <- svycoxph(main_model_formula, design = design)
+    sum_fit <- summary(main_fit)
+    hrs <- sum_fit$conf.int
+    coefs <- sum_fit$coefficients
+    
+    tidy_main_model <- data.frame(
+      Variable = rownames(hrs),
+      HR = hrs[, "exp(coef)"],
+      `CI.Lower` = hrs[, "lower .95"],
+      `CI.Upper` = hrs[, "upper .95"],
+      `p.value` = coefs[, "Pr(>|z|)"],
+      row.names = NULL,
+      check.names = FALSE
+    )
+    print("--- Tidy Table for Final Paper (if Constant Effect Assumption is Met) ---")
+    print(knitr::kable(tidy_main_model, digits = 3, format = "pipe"))
+    cat("\n\n") # Add spacing
+  }
+  
+  
+  # --- 3. Define Cut-points Based on Event Time Quantiles ---
+  event_times <- data_clean[[time_var]][data_clean[[status_var]] == 1]
+  probs <- (1:(n_intervals - 1)) / n_intervals
+  cuts <- quantile(event_times, probs = probs, na.rm = TRUE)
+  
+  print(paste("--- Running Constant Effect Check: Using", n_intervals, "intervals based on these cut-points ---"))
+  print(cuts)
+  
+  # --- 4. Create (start, stop) data ---
+  split_formula <- as.formula(paste0("Surv(", time_var, ", ", status_var, ") ~ ."))
+  
+  split_data <- survSplit(split_formula, 
+                          data = data_clean, 
+                          cut = cuts,
+                          episode = "tgroup",
+                          id = "internal_split_id")
+  
+  # --- 5. Create the new survey design object ---
+  call <- design$call
+  call$data <- split_data 
+  split_design <- eval(call, envir = environment())
+  
+  # --- 6. Loop, Fit Models, and Extract Coefficients ---
+  plot_results_list <- list()
+  summary_results_list <- list() 
+  time_intervals <- c(0, cuts, max(split_data[[time_var]]))
+  
+  loop_formula <- as.formula(
+    paste0("Surv(tstart, ", time_var, ", ", status_var, ") ~ ", formula_rhs)
+  )
+  
+  for (i in 1:n_intervals) {
+    
+    if (verbose) {
+      print(paste("--- Debug: Fitting model for tgroup", i, "---"))
+    }
+    
+    fit <- tryCatch({
+      design_subset <- subset(split_design, tgroup == i)
+      svycoxph(loop_formula, design = design_subset)
+    }, error = function(e) { 
+      if (verbose) {
+        print(paste("Warning: Model for tgroup", i, "failed to converge:", e$message))
+      }
+      NULL 
+    })
+    
+    if (!is.null(fit)) {
+      if (verbose) {
+        print(paste("Model for tgroup", i, "converged successfully."))
+      }
+      
+      sum_fit <- summary(fit)
+      hrs <- sum_fit$conf.int
+      coefs <- sum_fit$coefficients
+      
+      # --- Extract data for the Tidy Summary Table ---
+      if (print_split_summary) {
+        tidy_summary <- data.frame(
+          Time.Interval = paste0(round(time_intervals[i], 0), "-", round(time_intervals[i+1], 0), " units"),
+          Variable = rownames(hrs),
+          N = sum_fit$n,
+          Events = sum_fit$nevent,
+          HR = hrs[, "exp(coef)"],
+          `CI.Lower` = hrs[, "lower .95"],
+          `CI.Upper` = hrs[, "upper .95"], # <-- TYPO FIX (was .9G)
+          `p.value` = coefs[, "Pr(>|z|)"],
+          row.names = NULL,
+          check.names = FALSE
+        )
+        summary_results_list[[i]] <- tidy_summary
+      }
+      
+      # --- Extract data for the Plot ---
+      if (var_to_test %in% rownames(coefs)) {
+        coef <- coefs[var_to_test, "coef"]
+        se <- coefs[var_to_test, "robust se"]
+      } else {
+        coef <- 0 
+        se <- 0
+      }
+      
+      plot_results_list[[i]] <- data.frame(
+        tgroup = i,
+        time = (time_intervals[i] + time_intervals[i+1]) / 2, 
+        coef = coef,
+        se = se
+      )
+    }
+  }
+  
+  # --- 7. Print Tidy Summary Table (if requested) ---
+  if (print_split_summary) {
+    full_summary_df <- do.call(rbind, summary_results_list)
+    print("--- Tidy Summary of All Time-Interval Models (if Constant Effect Assumption is Violated) ---")
+    print(knitr::kable(full_summary_df, digits = 3, format = "pipe"))
+    cat("\n\n") # Add spacing
+  }
+  
+  # --- 8. Combine and Plot the Results ---
+  results_df <- do.call(rbind, plot_results_list)
+  
+  if (is.null(results_df) || nrow(results_df) == 0) {
+    stop("All models failed to converge or the variable was not found.")
+  }
+  
+  results_df <- results_df %>%
+    mutate(
+      ci_low = coef - 1.96 * se,
+      ci_high = coef + 1.96 * se
+    )
+  
+  print("--- Estimated Coefficients over Time (for Plot) ---")
+  print(knitr::kable(results_df, digits = 3, format = "pipe"))
+  
+  # --- 9. Build the Plot ---
+  plot_title <- if (is.null(title)) paste("Time-Varying Effect Plot:", var_to_test) else title
+  plot_xlab <- if (is.null(xlab)) "Follow-up Time" else xlab
+  plot_ylab <- if (is.null(ylab)) paste("Log-Hazard Ratio (Coefficient) for", var_to_test) else ylab
+  
+  plot_theme <- if (use_classic_theme) { 
+    theme_classic() 
+  } else { 
+    theme_minimal() 
+  }
+  
+  p <- ggplot(results_df, aes(x = time, y = coef)) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 10) +
+    plot_theme +
+    labs(title = plot_title, x = plot_xlab, y = plot_ylab)
+  
+  if (show_null_effect) {
+    p <- p + geom_hline(yintercept = 0, linetype = "dashed", color = "red")
+  }
+  
+  if (add_smoother) {
+    p <- p + geom_smooth(se = FALSE, linetype = "dotted", color = "blue")
+  }
+  
+  return(p)
+}
+
+
+```
+
+
+
+## c)Check the Proportional Hazards (PH) assumption for the variable active_asthma
+```{r}
+
+# --- 1. Define your model formula (RHS only) ---
+my_formula <- "active_asthma + sex + age + race + marital + smokes + diet + duration + 
+               cancer + employed + cycle_year + education + 
+               PIR_cat + BMI_cat + vigorous.work "
+
+# --- 2. Define the variable you want to plot ---
+# Note: This MUST be the exact name from the model summary
+my_var_to_test <- "active_asthma" 
+
+# --- 3. Fit the Main (Constant Effect) Model ---
+# We must fit this first to pass it to the function
+print("--- Fitting Main Pooled (Constant Effect) Model ---")
+
+# Create the un-split imputation list first
+allImputations_main <- imputationList(split(impdata_filtered, 
+                                            impdata_filtered$.imp))
+# Create the main design
+design_full_main <- svydesign(ids = ~psu,
+                              strata = ~strata,
+                              weights = ~survey.weight,
+                              nest = TRUE,
+                              data = allImputations_main)
+
+design_analytic_main <- subset(design_full_main, ineligible == 0)
+
+# Define the formula
+main_formula <- as.formula(
+  paste0("Surv(followup, death) ~ ", my_formula)
+)
+
+# Fit and pool the main model
+main_fit_list <- with(design_analytic_main, svycoxph(main_formula))
+main_fit_pooled <- pool(main_fit_list)
+
+
+# --- 4. Run the Test Function ---
+
+# Save the plot object to a variable
+my_ph_plot <- svycoxph_CE_mi(
+  formula_rhs = my_formula, 
+  design_split = design_analytic_split, 
+  var_to_test = my_var_to_test,
+  tgroup_var = "tgroup",
+  time_var = "followup",
+  status_var = "death",
+  main_model_fit = main_fit_pooled, 
+  print_split_summary = TRUE,
+  show_null_effect = FALSE
+)
+
+# Now, explicitly print the plot
+print(my_ph_plot)
+
+```
+
+
+
+
+# Step 4:Constructing a table 1: Descriptive analysis
+
+```{r}
+
+library(dplyr)
+library(gtsummary)
+
+# Ensure death is a factor with readable labels
+d.analytic2 <-d.analytic %>%
+  mutate(
+    death = factor(death, levels = c(0, 1), labels = c("Alive", "Dead"))
+  )
+
+# Variables to include
+vars <- c(
+  "followup","sex","age","race","marital","smokes","diet",
+  "ever_asthma","active_asthma","emergency_asthma","cancer",
+  "vigorous.work","employed","cycle_year",
+  "education","PIR_cat","duration","BMI_cat"
+)
+
+# Create Table 1
+tbl1 <- d.analytic2 %>%
+  dplyr::select(dplyr::all_of(vars), death) %>%
+  tbl_summary(
+    by = death,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+
+tbl1
+
+# Save directly to Word document
+tbl1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "table_one11.docx")
+
+
+
+```
+
+
+
+# Step 7: Primary Analysis
+
+## a)Fitting unadjusted model (active asthma)
+
+```{r}
+
+unadj.active <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ active_asthma  ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(unadj.active)
+
+
+# Display the final, pooled results.
+print("--- Final unadjusted Cox Model Results  ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+## b) Fitting adjusted Model
+```{r}
+
+
+adj.active <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ active_asthma + sex+ age + race + duration + 
+                              marital + smokes + diet + cancer + employed + 
+                              cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(adj.active)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+## Relevel duration once, outside the model
+```{r}
+design_analytic_main <- update(
+  design_analytic_main,
+  duration = relevel(duration, ref = "Normal")
+)
+
+```
+
+
+
+## c) Fit the interaction model
+```{r}
+
+
+int_active_mira <- with(
+  design_analytic_main,
+  svycoxph(
+    Surv(followup, death) ~ 
+      active_asthma * duration +                
+      sex + age + race + 
+      marital + smokes + diet + cancer + employed +
+      cycle_year + education + PIR_cat + BMI_cat + vigorous.work
+  )
+)
+
+
+# Pool and check again
+pooled_results <- pool(int_active_mira)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+
+
+```
+
+
+
+## Testing additive interaction
+```{r}
+
+# Defining contrasts to pass to `svycontrast`
+# NOTE: Suffixes .1 and .2 and .3 are used instead of .10 and .01 and .11.
+#       However, a translation key is provided below
+#
+# r.1 == RR.1.0
+# r.2 == RR.0.1
+# r.3 == RR.1.1
+
+## beta coefficients (from the regression model)
+## beta coefficients (from the regression model)
+b.list <- list(
+  b.s.1 = "active_asthma",
+  b.s.2 = "durationShort",
+  b.s.3 = "`active_asthma:durationShort`",  # <- backticks
+  b.l.1 = "active_asthma",
+  b.l.2 = "durationLong",
+  b.l.3 = "`active_asthma:durationLong`"    # <- backticks
+)
+
+
+## ratio coefficients (e.g., HRs)
+r.list <-
+  list(r.1.s = 'exp(b.s.1)',
+       r.2.s = 'exp(b.s.2)',
+       r.3.s = 'exp(b.s.1 + b.s.2 + b.s.3)',
+       r.1.l = 'exp(b.l.1)',
+       r.2.l = 'exp(b.l.2)',
+       r.3.l = 'exp(b.l.1 + b.l.2 + b.l.3)')
+
+## reri coefficients
+reri.list <-
+  list(reri.s = 'r.3.s - r.1.s - r.2.s + 1', 
+       reri.l = 'r.3.l - r.1.l - r.2.l + 1')
+
+## ap coefficients
+ap.list <- list(ap.s = 'reri.s/r.3.s', ap.l = 'reri.l/r.3.l')
+
+## si coefficients
+si.list <-
+  list(si.s = '(r.3.s - 1)/((r.1.s - 1) + (r.2.s - 1))',
+       si.l = '(r.3.l - 1)/((r.1.l - 1) + (r.2.l - 1))')
+
+# The estimation procedure
+# NOTE: `survey::svycontrast` is used to implement the (non)linear combinations.
+library(survey)
+library(mitools)
+
+mi.list.of.svycoxph.models <- int_active_mira
+mi.list.of.svycoxph.models |>
+   lapply(svycontrast, contrast = lapply(b.list, str2expression)) |>
+   lapply(svycontrast, contrast = lapply(r.list, str2expression), add = TRUE) |>
+   lapply(svycontrast, contrast = lapply(reri.list, str2expression), add = TRUE) |>
+   lapply(svycontrast, contrast = lapply(ap.list, str2expression), add = TRUE) |>
+   lapply(svycontrast, contrast = lapply(si.list, str2expression), add = TRUE) |>
+   mitools::MIcombine() |>
+   summary(conf.int = TRUE)
+
+```
+
+
+
+
+## h) Strata-Specific hazard ratios
+
+```{r}
+
+mod.1  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+mod.2  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Short") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+mod.3  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Long") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results1 <- pool(mod.1)
+pooled_results2 <- pool(mod.2)
+pooled_results3 <- pool(mod.3)
+
+# Final results
+summary(pooled_results1, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results2, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results3, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+## i) Presenting the findings on forest plot
+
+```{r}
+
+library(tidyverse) # Includes ggplot2 and dplyr
+
+# Create the data frame
+hr_data <- tibble::tribble(
+  ~Model, ~HR, ~Conf_low, ~Conf_high,
+  "Crude", 1.62, 1.44, 1.81,
+  "Adjusted", 1.38, 1.23, 1.56,
+  "Short Sleep duration", 1.50, 1.26, 1.79,
+  "Long Sleep duration", 1.44, 1.06, 1.97,
+  "Normal sleep duration", 1.23, 0.99, 1.55
+)
+
+# Crucial step: Convert 'Model' to a factor and reverse the order
+# This ensures they plot from top to bottom in the desired order
+hr_data <- hr_data %>%
+  mutate(Model = factor(Model, levels = rev(c("Crude", "Adjusted", "Short Sleep duration", "Long Sleep duration", "Normal sleep duration"))))
+
+
+forest_plot <- ggplot(hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+  
+  # 1. Add the horizontal confidence interval lines (whiskers)
+  geom_errorbarh(height = 0.1, linewidth = 0.8, color = "black") +
+  
+  # 2. Add the point estimate (Hazard Ratio)
+  geom_point(shape = 18, size = 4, color = "black") +
+  
+  # 3. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  
+  # 4. Add the labels (HR and 95% CI) next to the points
+  geom_text(aes(label = sprintf("%.2f (%s, %s)", HR, Conf_low, Conf_high)),
+            x = max(hr_data$Conf_high) + 0.5, # Position the text far to the right
+            hjust = 0, size = 3.5) +
+  
+  # 5. Set the X-axis to a log scale (common for ratio measures like HR)
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5),
+    limits = c(0.8, max(hr_data$Conf_high) + 1.2) # Adjust limits to fit the CIs and the text
+  ) +
+  
+  # 6. Customize Titles and Theme
+  labs(
+    y = "Model / Variable",
+    title = "Forest Plot of Hazard Ratios/Active asthma"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    panel.grid.major.y = element_blank(), # Remove horizontal grid lines
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(), # Remove the Y-axis title (since model names are descriptive)
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = unit(c(1, 4, 1, 1), "lines") # Increase right margin for the text labels
+  )
+
+# Print the plot
+print(forest_plot)
+
+```
+
+
+
+## j)Kaplan_Meier plot by active asthma status
+
+```{r}
+
+# 1. Fit svykm within the multiple imputation framework (No change needed here)
+km_fit_list <- with(design_analytic_main, 
+                    svykm(Surv(followup, death) ~ active_asthma, 
+                          design = design, 
+                          se = FALSE, 
+                          ci = FALSE))
+
+# 2. Extract results from the FIRST imputation for plotting (No change needed here)
+km_fit_first <- km_fit_list[[1]]
+
+# 3. Process the data for plotting (No change needed here)
+km_df <- purrr::imap_dfr(km_fit_first, function(fit, grp) {
+  tibble(
+    time            = fit$time,
+    surv            = fit$surv,
+    active_asthma   = grp # This will be the levels of your grouping variable
+  )
+})
+
+# 4. Generate the plot (MODIFICATIONS HERE)
+ggplot(km_df, aes(x = time, y = surv, color = active_asthma)) +
+  geom_step(linewidth = 0.9) +
+  
+  # --- MODIFICATION 1: Change the y-axis scale back to decimal (0-1) ---
+  scale_y_continuous(limits = c(0, 1)) + 
+  
+  # --- MODIFICATION 2: Rename the legend labels ---
+  scale_color_manual(values = c("0" = "darkgrey", "1" = "black"), # Assign colors to ensure consistency
+                     labels = c("0" = "No", "1" = "Yes")) +
+  
+  labs(
+    title = "Survey-weighted Kaplan–Meier survival by active asthma",
+    x     = "Months since interview",
+    y     = "Survival probability",
+    color = "Active Asthma"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+## Black and white KM curves
+
+```{r}
+
+# 4. Generate the plot (MODIFICATIONS HERE)
+ggplot(km_df, aes(x = time, y = surv, color = active_asthma)) +
+ geom_step(aes(linetype = active_asthma), linewidth = 0.9) +
+
+ # --- MODIFICATION 1: Change the y-axis scale back to decimal (0-1) ---
+ scale_y_continuous(limits = c(0, 1)) +
+  
+ # --- MODIFICATION 2: Change to black/white, straight/dashed lines ---
+ scale_color_manual(values = c("0" = "black", "1" = "black"), # Both lines are black
+labels = c("0" = "No", "1" = "Yes")) +
+ # --- ADDITION 3: Define the line types ---
+ scale_linetype_manual(values = c("0" = "solid", "1" = "dashed"), # Red (0) becomes solid, Blue (1) becomes dashed
+ labels = c("0" = "No", "1" = "Yes")) +
+
+ labs(
+ title = "Survey-weighted Kaplan–Meier survival by active asthma",
+ x= "Months since interview",
+ y= "Survival probability",
+color = "Active Asthma" # Note: 'color' is used for the legend, which now represents linetype and color
+ ) +
+ theme_minimal(base_size = 12) +
+ theme(panel.grid.minor = element_blank())
+
+```
+
+
+
+## k) Checking for multicollinearity/ Active asthma
+```{r}
+# For survey models, wet need to fit a linear model to check VIF
+
+library(car)
+
+# Fit a linear model with the same predictors (using one imputation)
+
+if("designs" %in% names(design_analytic_main)) {
+  single_design <- design_analytic_main$designs[[1]]  #  using mitools
+} else {
+  single_design <- design_analytic_main  # it's a single svydesign object
+}
+
+# Fit a linear model to check VIF - FIXED SYNTAX
+lm_for_vif <- svyglm(age ~ active_asthma + sex + marital + smokes + diet + 
+                      cancer + employed + cycle_year + education + PIR_cat + BMI_cat + vigorous.work,
+                    design = single_design) 
+
+# Calculate VIF
+vif_values <- vif(lm_for_vif)
+print("Variance Inflation Factors:")
+print(vif_values)
+
+# Identify problematic VIF values (typically > 5 or > 10)
+problematic_vif <- which(vif_values > 5)
+if(length(problematic_vif) > 0) {
+  print("Variables with VIF > 5:")
+  print(vif_values[problematic_vif])
+} else {
+  print("No multicollinearity concerns based on VIF.")
+}
+
+```
+
+
+# Step 8: Sensitivity Analysis : ever asthma as exposure 
+
+## a) Unadjusted Cox model 
+```{r}
+
+# fit the model
+
+unadj.ever <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ ever_asthma  ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(unadj.ever)
+
+
+# Display the final, pooled results.
+print("--- ever unadjusted Cox Model Results  ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+
+## b) Adjusted Cox model ---ever
+```{r}
+
+# fit the model
+
+adj.ever <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ ever_asthma + sex+ age + race + duration + 
+                              marital + smokes + diet + cancer + employed + 
+                              cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(adj.ever)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+
+## c) Cox model with interactions (ever asthma)
+```{r}
+
+int.ever <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ ever_asthma * relevel(duration, ref = "Normal") + sex + age + race +
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(int.ever)
+
+
+# Display the final, pooled results.
+print("--- Final interactionCox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+
+## d) Strata-specific hazard ratios ( exposure: ever asthma)
+
+
+```{r}
+
+mod.4  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ ever_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+mod.5  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ ever_asthma * relevel(duration, ref = "Short") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+mod.6  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ ever_asthma * relevel(duration, ref = "Long") + sex + age + race +
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results4 <- pool(mod.4)
+pooled_results5 <- pool(mod.5)
+pooled_results6 <- pool(mod.6)
+
+# Final results
+summary(pooled_results4, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results5, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results6, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+## e) Forest plots for Hazards ratios for ever asthma
+
+```{r}
+library(tidyverse) # Includes ggplot2 and dplyr
+
+# Create the data frame
+hr_data <- tibble::tribble(
+  ~Model, ~HR, ~Conf_low, ~Conf_high,
+  "Crude", 1.17, 1.04, 1.31,
+  "Adjusted", 1.17, 1.05, 1.31,
+  "Short Sleep duration", 1.18, 0.98, 1.42,
+  "Long Sleep duration", 1.41, 1.03, 1.92,
+  "Normal sleep duration", 1.10, 0.91, 1.32
+)
+
+# Crucial step: Convert 'Model' to a factor and reverse the order
+# This ensures they plot from top to bottom in the desired order
+hr_data <- hr_data %>%
+  mutate(Model = factor(Model, levels = rev(c("Crude", "Adjusted", "Short Sleep duration", "Long Sleep duration", "Normal sleep duration"))))
+
+
+forest_plot <- ggplot(hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+  
+  # 1. Add the horizontal confidence interval lines (whiskers)
+  geom_errorbarh(height = 0.1, linewidth = 0.8, color = "red") +
+  
+  # 2. Add the point estimate (Hazard Ratio)
+  geom_point(shape = 18, size = 4, color = "red") +
+  
+  # 3. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  
+  # 4. Add the labels (HR and 95% CI) next to the points
+  geom_text(aes(label = sprintf("%.2f (%s, %s)", HR, Conf_low, Conf_high)),
+            x = max(hr_data$Conf_high) + 0.5, # Position the text far to the right
+            hjust = 0, size = 3.5) +
+  
+  # 5. Set the X-axis to a log scale (common for ratio measures like HR)
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5),
+    limits = c(0.8, max(hr_data$Conf_high) + 1.2) # Adjust limits to fit the CIs and the text
+  ) +
+  
+  # 6. Customize Titles and Theme
+  labs(
+    y = "Model / Variable",
+    title = "Forest Plot of Hazard Ratios/ever asthma"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(), # Remove horizontal grid lines
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(), # Remove the Y-axis title (since model names are descriptive)
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = unit(c(1, 4, 1, 1), "lines") # Increase right margin for the text labels
+  )
+
+# Print the plot
+print(forest_plot)
+
+```
+
+
+## f) Kaplan_Meir plot by ever asthma status
+
+```{r}
+
+# 1. Fit svykm within the multiple imputation framework (No change needed here)
+km_fit_list <- with(design_analytic_main, 
+                    svykm(Surv(followup, death) ~ ever_asthma, 
+                          design = design, 
+                          se = FALSE, 
+                          ci = FALSE))
+
+# 2. Extract results from the FIRST imputation for plotting (No change needed here)
+km_fit_first <- km_fit_list[[1]]
+
+# 3. Process the data for plotting (No change needed here)
+km_df <- purrr::imap_dfr(km_fit_first, function(fit, grp) {
+  tibble(
+    time            = fit$time,
+    surv            = fit$surv,
+    active_asthma   = grp # This will be the levels of your grouping variable
+  )
+})
+
+# 4. Generate the plot (MODIFICATIONS HERE)
+ggplot(km_df, aes(x = time, y = surv, color = active_asthma)) +
+  geom_step(linewidth = 0.9) +
+  
+  # --- MODIFICATION 1: Change the y-axis scale back to decimal (0-1) ---
+  scale_y_continuous(limits = c(0, 1)) + 
+  
+  # --- MODIFICATION 2: Rename the legend labels ---
+  scale_color_manual(values = c("0" = "red", "1" = "blue"), # Assign colors to ensure consistency
+                     labels = c("0" = "No", "1" = "Yes")) +
+  
+  labs(
+    title = "Survey-weighted Kaplan–Meier survival by ever asthma",
+    x     = "Months since interview",
+    y     = "Survival probability",
+    color = "ever Asthma "
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+```
+
+## f) Checking for multicollinearity/ Ever asthma
+```{r}
+
+# Fit a linear model to check VIF - FIXED SYNTAX
+lm_for_vif1 <- svyglm(age ~ ever_asthma + sex + marital + smokes + diet + 
+                      cancer + employed + cycle_year + education + PIR_cat + BMI_cat + vigorous.work,
+                    design = single_design) 
+
+# Calculate VIF
+vif_values <- vif(lm_for_vif)
+print("Variance Inflation Factors:")
+print(vif_values)
+
+# Identify problematic VIF values (typically > 5 or > 10)
+problematic_vif <- which(vif_values > 5)
+if(length(problematic_vif) > 0) {
+  print("Variables with VIF > 5:")
+  print(vif_values[problematic_vif])
+} else {
+  print("No multicollinearity concerns based on VIF.")
+}
+```
+
+
+
+# Step 9: Sensitivity Analysis : emergency hosp for asthma as exposure
+
+## a) Unadjusted Cox model with emergency hosp with asthma
+```{r}
+
+# fit the model
+
+unadj.emergency <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ emergency_asthma ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(unadj.emergency)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results with time ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+## b) Adjusted Cox model with emergency hosp
+```{r}
+
+
+# fit the model
+
+adj.emergency <- with(design_analytic_main,
+                   svycoxph(Surv(followup, death) ~ emergency_asthma + sex+ age + race + duration + 
+                              marital + smokes + diet + cancer + employed + 
+                              cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(adj.emergency)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+## c) Cox model with interactions (emergency asthma)
+
+```{r}
+
+int.emergency <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ emergency_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(int.emergency)
+
+
+# Display the final, pooled results.
+print("--- Final interactionCox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+## d) Exploring effect modification by sleep duration
+
+```{r}
+mod.7  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ emergency_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+mod.8  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ emergency_asthma * relevel(duration, ref = "Short") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat  + vigorous.work))
+
+mod.9  <- with(design_analytic_main,
+                            svycoxph(Surv(followup, death) ~ emergency_asthma * relevel(duration, ref = "Long") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results7 <- pool(mod.7)
+pooled_results8 <- pool(mod.8)
+pooled_results9 <- pool(mod.9)
+
+# Final results
+summary(pooled_results7, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results8, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results9, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+## e) Forest Plots for Emergency asthma
+
+```{r}
+
+library(tidyverse)
+
+# Create the data frame
+hr_data <- tibble::tribble(
+  ~Model, ~HR, ~Conf_low, ~Conf_high,
+  "Crude", 1.96, 1.40, 2.78,
+  "Adjusted", 1.74, 1.26, 2.41,
+  "Short Sleep duration", 1.85, 1.23, 2.80,
+  "Long Sleep duration", 1.55, 0.75, 3.20,
+  "Normal sleep duration", 1.63, 0.85, 3.16
+)
+
+# Convert 'Model' to a factor with reversed order
+hr_data <- hr_data %>%
+  mutate(Model = factor(Model, levels = rev(c("Crude", "Adjusted", "Short Sleep duration", "Long Sleep duration", "Normal sleep duration"))))
+
+# Calculate dynamic limits for better text positioning
+x_max <- max(hr_data$Conf_high, na.rm = TRUE)
+text_x_position <- x_max + 0.5
+
+forest_plot <- ggplot(hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+  
+  # 1. Add the horizontal confidence interval lines (whiskers)
+  geom_errorbarh(height = 0.1, linewidth = 0.8, color = "violet") +
+  
+  # 2. Add the point estimate (Hazard Ratio)
+  geom_point(shape = 18, size = 4, color = "violet") +
+  
+  # 3. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  
+  # 4. Add the labels (HR and 95% CI) next to the points
+  geom_text(aes(label = sprintf("%.2f (%.2f, %.2f)", HR, Conf_low, Conf_high)),
+            x = text_x_position,
+            hjust = 0, size = 3.5) +
+  
+  # 5. Set the X-axis with appropriate limits
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    limits = c(0.4, text_x_position + 1.0) # Adjusted to fit all elements
+  ) +
+  
+  # 6. Customize Titles and Theme
+  labs(
+    y = NULL,
+    title = "Forest Plot of HRs for Emerg. Hosp for Asthma"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = unit(c(1, 6, 1, 1), "lines") # Increased right margin for text
+  )
+
+# Print the plot
+print(forest_plot)
+
+```
+
+
+## f) Kaplan_Meir plot by emergency hospitalization for asthma past year 
+
+```{r}
+# 1. Fit svykm within the multiple imputation framework (No change needed here)
+km_fit_list <- with(design_analytic_main, 
+                    svykm(Surv(followup, death) ~ emergency_asthma, 
+                          design = design, 
+                          se = FALSE, 
+                          ci = FALSE))
+
+# 2. Extract results from the FIRST imputation for plotting (No change needed here)
+km_fit_first <- km_fit_list[[1]]
+
+# 3. Process the data for plotting (No change needed here)
+km_df <- purrr::imap_dfr(km_fit_first, function(fit, grp) {
+  tibble(
+    time            = fit$time,
+    surv            = fit$surv,
+    emergency_asthma   = grp # This will be the levels of your grouping variable
+  )
+})
+
+# 4. Generate the plot (MODIFICATIONS HERE)
+ggplot(km_df, aes(x = time, y = surv, color = emergency_asthma)) +
+  geom_step(linewidth = 0.9) +
+  
+  # --- MODIFICATION 1: Change the y-axis scale back to decimal (0-1) ---
+  scale_y_continuous(limits = c(0, 1)) + 
+  
+  # --- MODIFICATION 2: Rename the legend labels ---
+  scale_color_manual(values = c("0" = "red", "1" = "blue"), # Assign colors to ensure consistency
+                     labels = c("0" = "No", "1" = "Yes")) +
+  
+  labs(
+    title = "Survey-weighted KM survival by emergency hosp. for asthma",
+    x     = "Months since interview",
+    y     = "Survival probability",
+    color = "Asthma/EM "
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+
+# Step 10: Sensitivity Analysis :  Restricting to age category 18-65
+
+## a) create a design object
+
+```{r}
+
+#1. Subsetted Design Object
+design_age_subset <- subset(design_analytic_main, age >= 18 & age <= 65)
+
+
+```
+
+
+## b) Fitting unadjusted cox model 
+```{r}
+# 2. Fit the svycoxph model on the age-restricted design
+
+unadj.active_18_65 <- with(design_age_subset,
+                                svycoxph(Surv(followup, death) ~ active_asthma ))
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(unadj.active_18_65)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+## c) Fitting adjusted Model
+```{r}
+
+
+
+adj.active.18_65<- with(design_age_subset,
+                   svycoxph(Surv(followup, death) ~ active_asthma + sex+ age + race + duration +
+                              marital + smokes + diet + cancer + employed + 
+                              cycle_year + education + PIR_cat + BMI_cat + vigorous.work  ))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(adj.active.18_65)
+
+
+# Display the final, pooled results.
+print("--- Final adjusted Cox Model Results with time ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+## d) Cox model with interaction 
+```{r}
+
+int.active.18_65 <- with(design_age_subset,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work  ))
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results <- pool(int.active.18_65)
+
+
+# Display the final, pooled results.
+print("--- Final interactionCox Model Results with time ---")
+
+# Final Adjusted Cox Model Results (from Pooled Imputed Data)
+summary(pooled_results, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
+
+## e) Exploring effect modification by sleep duration/ Age_18-65
+
+
+```{r}
+
+mod.13 <- with(design_age_subset,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work ))
+
+mod.14  <- with(design_age_subset,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Short") + sex + age + race + 
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+mod.15  <- with(design_age_subset,
+                            svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Long") + sex + age + race +
+                                       marital + smokes + diet + cancer + employed +
+                                       cycle_year + education + PIR_cat + BMI_cat + vigorous.work))
+
+
+# Pool the results from the list of model fits using Rubin's Rules.
+pooled_results13 <- pool(mod.13)
+pooled_results14 <- pool(mod.14)
+pooled_results15 <- pool(mod.15)
+
+# Final results
+summary(pooled_results13, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results14, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_results15, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+## f) Forest Plots of results for model restricting age to 18-65
+
+```{r}
+
+library(tidyverse)
+
+# Create the data frame
+hr_data <- tibble::tribble(
+  ~Model, ~HR, ~Conf_low, ~Conf_high,
+  "Crude", 1.91, 1.61, 2.26,
+  "Adjusted", 1.39, 1.16, 1.67,
+  "Short Sleep duration", 1.63, 1.30, 2.04,
+  "Long Sleep duration", 1.40, 0.70, 2.79,
+  "Normal sleep duration", 1.06, 0.76, 1.48
+)
+
+# Convert 'Model' to a factor with reversed order
+hr_data <- hr_data %>%
+  mutate(Model = factor(Model, levels = rev(c("Crude", "Adjusted", "Short Sleep duration", "Long Sleep duration", "Normal sleep duration"))))
+
+# Calculate dynamic limits for better text positioning
+x_max <- max(hr_data$Conf_high, na.rm = TRUE)
+text_x_position <- x_max + 0.5
+
+forest_plot <- ggplot(hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+  
+  # 1. Add the horizontal confidence interval lines (whiskers)
+  geom_errorbarh(height = 0.1, linewidth = 0.8, color = "brown") +
+  
+  # 2. Add the point estimate (Hazard Ratio)
+  geom_point(shape = 18, size = 4, color = "brown") +
+  
+  # 3. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  
+  # 4. Add the labels (HR and 95% CI) next to the points
+  geom_text(aes(label = sprintf("%.2f (%.2f, %.2f)", HR, Conf_low, Conf_high)),
+            x = text_x_position,
+            hjust = 0, size = 3.5) +
+  
+  # 5. Set the X-axis with appropriate limits
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    limits = c(0.4, text_x_position + 1.0) # Adjusted to fit all elements
+  ) +
+  
+  # 6. Customize Titles and Theme
+  labs(
+    y = NULL,
+    title = "Forest Plot of HRs for Model w/18-65"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = unit(c(1, 6, 1, 1), "lines") # Increased right margin for text
+  )
+
+# Print the plot
+print(forest_plot)
+
+```
+
+
+
+# Step 12: Sensitivity Analysis : Complete case analysis
+
+## a) Build  the design for complete case 
+
+
+```{r}
+
+library(dplyr)
+library(survey)
+
+# 1. List the variables that must be complete for your primary model
+vars_for_model <- c(
+  "death", "followup", "survey.weight", "psu", "strata",
+  "sex", "age", "race", "marital", "smokes", "diet",
+  "ever_asthma", "active_asthma", "emergency_asthma", "cancer",
+  "vigorous.work", "employed", "cycle_year",
+   "education", "PIR_cat", "duration", "BMI_cat"
+)
+
+# 2. Create complete-case analytic dataset
+d_cc <- d.analytic %>%
+  filter(if_all(all_of(vars_for_model), ~ !is.na(.)))
+
+# Quick check of how many remain
+nrow(d.analytic)
+nrow(d_cc)
+
+# 3. Define the survey design on the complete-case data
+design_cc <- svydesign(
+  ids     = ~psu,
+  strata  = ~strata,
+  weights = ~survey.weight,
+  nest    = TRUE,
+  data    = d_cc
+)
+
+
+```
+
+
+## b) Unadjusted Cox model with complete case
+```{r}
+## Fit the adjusted cox model on cc
+active.unadj.cc <- svycoxph(
+  Surv(followup, death) ~ 
+    active_asthma,
+  design = design_cc
+)
+
+summary(active.unadj.cc)
+```
+
+
+
+## c)  Adjusted Cox model with complete case 
+```{r}
+## Fit the adjusted cox model on cc
+active.adj.cc <- svycoxph(
+  Surv(followup, death) ~ 
+    active_asthma + sex + age + race + marital + smokes + diet + cancer + duration + 
+    employed + factor(cycle_year) + education + PIR_cat + BMI_cat + vigorous.work,
+  design = design_cc
+)
+
+summary(active.adj.cc)
+
+```
+
+
+## d) Cox model w/ interaction term on complete case 
+```{r}
+## Fit the adjusted cox model on cc
+active.int.cc <- svycoxph(
+  Surv(followup, death) ~ 
+    active_asthma +  active_asthma * relevel(duration, ref = "Normal")+ sex + age + race + marital + smokes + diet + cancer + 
+    employed + factor(cycle_year) + education + PIR_cat + BMI_cat + vigorous.work,
+  design = design_cc
+)
+
+summary(active.int.cc)
+
+```
+
+
+
+## d) Exploring effect modification by sleep duration/ complete case dataset
+
+```{r}
+
+# Fit Model directly on the single design_cc object
+mod.16.cc <- svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Normal") + sex + age + race + 
+                                           marital + smokes + diet + cancer + employed +
+                                           cycle_year + education + PIR_cat + BMI_cat + vigorous.work,
+                                  design = design_cc)
+
+# View the final results directly 
+summary(mod.16.cc, exp = TRUE)
+
+
+
+
+# Fit Model directly on the single design_cc object
+mod.17.cc <- svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Short") + sex + age + race + 
+                                           marital + smokes + diet + cancer + employed +
+                                           cycle_year + education + PIR_cat + BMI_cat + vigorous.work,
+                                  design = design_cc)
+
+# View the final results directly 
+summary(mod.17.cc, exp = TRUE)
+
+
+# Fit Model directly on the single design_cc object
+mod.18.cc <- svycoxph(Surv(followup, death) ~ active_asthma * relevel(duration, ref = "Long") + sex + age +
+                                           marital + smokes + diet + cancer + employed +
+                                           cycle_year + education + PIR_cat + BMI_cat + vigorous.work,
+                                  design = design_cc)
+
+# View the final results directly 
+summary(mod.18.cc, exp = TRUE)
+
+
+```
+
+
+
+## e) Forest Plots of results for Complete case
+
+```{r}
+
+library(tidyverse)
+
+# Create the data frame
+hr_data <- tibble::tribble(
+  ~Model, ~HR, ~Conf_low, ~Conf_high,
+  "Crude", 1.53, 1.28, 1.83,
+  "Adjusted", 1.27, 1.07, 1.52,
+  "Short Sleep duration", 1.33, 1.02, 1.73,
+  "Long Sleep duration", 1.42, 0.85, 2.38,
+  "Normal sleep duration", 1.19, 0.85, 1.68
+)
+
+# Convert 'Model' to a factor with reversed order
+hr_data <- hr_data %>%
+  mutate(Model = factor(Model, levels = rev(c("Crude", "Adjusted", "Short Sleep duration", "Long Sleep duration", "Normal sleep duration"))))
+
+# Calculate dynamic limits for better text positioning
+x_max <- max(hr_data$Conf_high, na.rm = TRUE)
+text_x_position <- x_max + 0.5
+
+forest_plot <- ggplot(hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+  
+  # 1. Add the horizontal confidence interval lines (whiskers)
+  geom_errorbarh(height = 0.1, linewidth = 0.8, color = "gray") +
+  
+  # 2. Add the point estimate (Hazard Ratio)
+  geom_point(shape = 18, size = 4, color = "gray") +
+  
+  # 3. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  
+  # 4. Add the labels (HR and 95% CI) next to the points
+  geom_text(aes(label = sprintf("%.2f (%.2f, %.2f)", HR, Conf_low, Conf_high)),
+            x = text_x_position,
+            hjust = 0, size = 3.5) +
+  
+  # 5. Set the X-axis with appropriate limits
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    limits = c(0.4, text_x_position + 1.0) # Adjusted to fit all elements
+  ) +
+  
+  # 6. Customize Titles and Theme
+  labs(
+    y = NULL,
+    title = "Forest Plot of HRs/ CCA"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = unit(c(1, 6, 1, 1), "lines") # Increased right margin for text
+  )
+
+# Print the plot
+print(forest_plot)
+
+```
+
+
+
+
+# Step 13: Presenting all results into one single forest plot
+
+```{r}
+
+library(tidyverse)
+library(ggplot2)
+
+# --- 1. Combined Data Setup ---
+
+model_levels <- c("Crude", "Adjusted", "Short Sleep", "Long Sleep", "Normal sleep")
+
+# Combine all data into one tibble (Using the group names provided by the user)
+all_hr_data <- bind_rows(
+  # Data for Active asthma (Primary model)
+  tibble::tribble(~Model, ~HR, ~Conf_low, ~Conf_high, "Crude", 1.62, 1.44, 1.81, "Adjusted", 1.38, 1.23, 1.56, "Short Sleep", 1.50, 1.26, 1.79, "Long Sleep", 1.44, 1.06, 1.97, "Normal sleep", 1.23, 0.91, 1.32) %>% mutate(Group = "Active"),
+  # Data for Ever asthma
+  tibble::tribble(~Model, ~HR, ~Conf_low, ~Conf_high, "Crude", 1.17, 1.04, 1.31, "Adjusted", 1.17, 1.05, 1.31, "Short Sleep", 1.18, 0.98, 1.42, "Long Sleep", 1.41, 1.03, 1.92, "Normal sleep", 1.10, 0.88, 1.36) %>% mutate(Group = "Ever"),
+  # Data for Emergency Hospitalization for Asthma
+  tibble::tribble(~Model, ~HR, ~Conf_low, ~Conf_high, "Crude", 1.96, 1.40, 2.78, "Adjusted", 1.74, 1.26, 2.41, "Short Sleep", 1.85, 1.23, 2.80, "Long Sleep", 1.55, 0.75, 3.20, "Normal sleep", 1.63, 0.85, 3.16) %>% mutate(Group = "Emerg."),
+  # Data for Age 18-65 model
+  tibble::tribble(~Model, ~HR, ~Conf_low, ~Conf_high, "Crude", 1.91, 1.61, 2.26, "Adjusted", 1.39, 1.16, 1.67, "Short Sleep", 1.63, 1.30, 2.04, "Long Sleep", 1.40, 0.70, 2.79, "Normal sleep", 1.06, 0.76, 1.48) %>% mutate(Group = "18-65"),
+  # Data for CCA model
+  tibble::tribble(~Model, ~HR, ~Conf_low, ~Conf_high, "Crude", 1.53, 1.28, 1.83, "Adjusted", 1.27, 1.07, 1.52, "Short Sleep", 1.33, 1.02, 1.73, "Long Sleep", 1.42, 0.85, 2.38, "Normal sleep", 1.19, 0.85, 1.68) %>% mutate(Group = "CCA")
+) %>%
+  # Ensure Model is a factor with a specific order (for y-axis display)
+  mutate(Model = factor(Model, levels = rev(model_levels)))
+
+
+# Define custom color palette based on your previous non-CCA colors
+color_palette <- c(
+  "Active" = "#4CAF50",        # Primary model is green
+  "Ever" = "#D946EF",        # Magenta / pink-purple
+  "Emerg." = "#4169E1",       # royal blue type
+  "18-65" = "#B49A2A",        # Mustard / yellow-brown / gold
+  "CCA" = "#54C3E8"           # <--- NEW REQUESTED COLOR: grey20
+)
+
+# --- 2. Create the Cleaned Consolidated Forest Plot ---
+
+# Calculate dynamic limits for text positioning
+max_ci_val <- max(all_hr_data$Conf_high, na.rm = TRUE)
+text_position_hr <- max_ci_val + 0.1 # Start HR/CI text slightly past the longest CI
+x_axis_max_limit <- max_ci_val + 1.2 # Set plot area max to fit the text labels
+
+forest_plot_combined_cleaned <- ggplot(all_hr_data, aes(y = Model, x = HR, xmin = Conf_low, xmax = Conf_high)) +
+
+  # 1. Add the vertical line at HR = 1 (the null line)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+
+  # 2. Add the horizontal confidence interval lines and point estimates
+  geom_errorbarh(aes(color = Group), height = 0.1, linewidth = 0.8, position = position_dodge(width = 0.7)) +
+  geom_point(aes(color = Group), shape = 18, size = 4, position = position_dodge(width = 0.7)) +
+
+  # 3. Add the labels (HR and 95% CI) on the right
+  geom_text(aes(label = sprintf("%.2f (%.2f, %.2f)", HR, Conf_low, Conf_high), color = Group),
+            x = text_position_hr, # Fixed x-position for HR(CI)
+            hjust = 0, size = 3.5, family = "mono",
+            position = position_dodge(width = 0.7),
+            # RE-ADDED BOLDING: Ensure the primary "Active" group text is bold
+            fontface = ifelse(all_hr_data$Group == "Active", "bold", "plain")) +
+
+  # 4. Apply the custom color scale
+  scale_color_manual(name = "Models", 
+                     values = color_palette,
+                     breaks = names(color_palette)) +
+
+  # 5. Set the X-axis scale
+  scale_x_continuous(
+    name = "Hazard Ratio (95% Confidence Interval)",
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    limits = c(0.4, x_axis_max_limit),
+    expand = expansion(mult = c(0.01, 0))
+  ) +
+
+  # 6. Customize Titles and Theme
+  labs(
+    y = NULL, # Remove Y-axis title
+    title = "Consolidated Forest Plot of Hazard Ratios"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    # legend to the right of the plot area
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+
+    # Fix to prevent the 'length 0' error
+    legend.text = element_text(size = 10),
+
+    # Remove horizontal grid lines
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+
+    # Set margins: (top, right, bottom, left)
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+
+    # Make Model labels bold
+    axis.text.y = element_text(face = "bold", size = 10)
+  )
+
+# Print the plot
+print(forest_plot_combined_cleaned)
+
+# Save the plot
+ggsave("forest_plot_custom_groups.png", plot = forest_plot_combined_cleaned, width = 14, height = 8, dpi = 300)
+```
+
