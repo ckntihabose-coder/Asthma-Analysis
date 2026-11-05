@@ -1568,6 +1568,7 @@ svycoxph_CE <- function(formula_rhs,
 
 
 
+
 ## c)Check the Proportional Hazards (PH) assumption for the variable active_asthma
 ```{r}
 
