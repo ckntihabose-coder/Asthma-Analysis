@@ -19,6 +19,8 @@ always_allow_html: true
 
 # Step 1: Data pulling and harmonization
 ## a) Libraries to be used
+
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
